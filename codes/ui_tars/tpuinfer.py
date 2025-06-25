@@ -149,4 +149,4 @@ def _mp_fn(index, user_task, max_steps):
 if __name__ == "__main__":
     user_task = "Find a folder called ui-tars"
     max_steps = 20
-    xmp.spawn(_mp_fn, args=(user_task, max_steps), nprocs=NUM_TPU_CORES)
+    xmp.spawn(_mp_fn, args=(user_task, max_steps))
