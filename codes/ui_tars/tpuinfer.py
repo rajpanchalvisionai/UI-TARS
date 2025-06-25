@@ -1,38 +1,47 @@
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from PIL import Image
 import os
 import time
 import pyautogui
 import sys
 
+# Add parent directory to sys.path to import action_parser and prompt
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from action_parser import parse_action_to_structure_output, parsing_response_to_pyautogui_code, smart_resize
 from prompt import COMPUTER_USE_DOUBAO
 
 model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 COORDINATE_PARSING_FACTOR = 1000
-NUM_TPU_CORES = 4  # v4-8 = 4 chips, 8 cores; adjust as needed
+NUM_TPU_CORES = 4  # Set to 8 if you have v4-8 with 8 cores
 
-def run_ui_agent(user_instruction, max_steps=10):
+def run_ui_agent(user_instruction, max_steps, processor, model, device):
     print(f"\n--- Starting UI Agent ---")
     print(f"Task: {user_instruction}")
-
-    conversation_history = []
 
     for step in range(max_steps):
         print(f"\n--- Step {step + 1}/{max_steps} ---")
         try:
+            # 1. Take Screenshot
+            print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
             img = screenshot
+
+            # Get original dimensions
             original_width, original_height = img.size
             print(f"Screenshot taken. Original dimensions: {original_width}x{original_height}")
+
+            # Calculate dimensions after smart resizing
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             print(f"Image will be processed by model at effective dimensions: {model_input_width}x{model_input_height}")
 
+            # 2. Format Prompt
             formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
+
+            # 3. Prepare Conversation Structure
             full_conversation = [
                 {
                     "role": "user",
@@ -43,6 +52,7 @@ def run_ui_agent(user_instruction, max_steps=10):
                 }
             ]
 
+            # 4. Process Input & Generate
             print("Applying chat template and tokenizing...")
             inputs = processor.apply_chat_template(
                 full_conversation,
@@ -74,6 +84,7 @@ def run_ui_agent(user_instruction, max_steps=10):
             print(raw_model_output_text)
             print("------------------------")
 
+            # 5. Parse Action from Output
             print("Parsing action from model output...")
             parsed_actions = parse_action_to_structure_output(
                 raw_model_output_text,
@@ -88,6 +99,7 @@ def run_ui_agent(user_instruction, max_steps=10):
                 print("No valid action parsed. Stopping.")
                 break
 
+            # 6. Convert to PyAutoGUI code & Execute
             pyautogui_code = parsing_response_to_pyautogui_code(
                 parsed_actions,
                 image_height=original_height,
@@ -118,10 +130,6 @@ def run_ui_agent(user_instruction, max_steps=10):
     print("\n--- UI Agent Finished ---")
 
 def _mp_fn(index, user_task, max_steps):
-    import torch
-    import torch_xla.core.xla_model as xm
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-
     print(f"Process {index}: Acquiring TPU device...")
     device = xm.xla_device()
     print(f"Process {index}: TPU device acquired: {device}")
@@ -136,12 +144,7 @@ def _mp_fn(index, user_task, max_steps):
     model.eval()
     print(f"Process {index}: Model and processor loaded successfully and moved to TPU.")
 
-    # Make processor/model global for run_ui_agent
-    global processor
-    global model
-    global device
-
-    run_ui_agent(user_task, max_steps)
+    run_ui_agent(user_task, max_steps, processor, model, device)
 
 if __name__ == "__main__":
     user_task = "Find a folder called ui-tars"
