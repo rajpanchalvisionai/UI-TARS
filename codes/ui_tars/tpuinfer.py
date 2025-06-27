@@ -5,8 +5,8 @@ import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.distributed.fsdp as xla_fsdp
 import functools
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-# This is the specific transformer block class for the Qwen2.5-VL model
-from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5VLAttention 
+# Use the correct attention class name
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 # --- END MODIFIED IMPORTS ---
 
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -15,7 +15,6 @@ import os
 import time
 import pyautogui
 import sys
-import math
 
 # Add parent directory to sys.path to import action_parser and prompt
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -30,21 +29,18 @@ def _mp_fn(index):
     # --- Model and Processor Setup ---
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # --- Load Model and Shard with MODERN FSDP ---
+    # --- Load Model and Shard with FSDP ---
     if xm.is_master_ordinal():
         print("Master process loading processor...")
     processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
     
-    # --- THIS IS THE KEY API CHANGE ---
-    # Define the wrapping policy using the standard PyTorch method.
-    # We tell it to find and shard any layer of type Qwen2_5VLAttention.
+    # Use the correct attention class
     qwen_fsdp_policy = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={
-            Qwen2_5VLAttention,
+            Qwen2Attention,  # CORRECT CLASS NAME
         },
     )
-    # --- END API CHANGE ---
 
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
@@ -55,9 +51,8 @@ def _mp_fn(index):
     )
     
     if xm.is_master_ordinal():
-        print("Applying FSDP and sharding the model across all 8 cores...")
+        print("Applying FSDP and sharding the model across all TPU cores...")
     
-    # We still use XlaFSDP, but now we pass it the new, correct policy.
     model = xla_fsdp.XlaFSDP(model, auto_wrap_policy=qwen_fsdp_policy)
     
     model.to(device)
@@ -79,6 +74,7 @@ def _mp_fn(index):
         else:
             img = Image.new('RGB', (100, 100))
 
+        # Broadcast screenshot to all cores
         object_list = [img]
         torch.distributed.broadcast_object_list(object_list, src=0)
         img = object_list[0]
@@ -89,6 +85,7 @@ def _mp_fn(index):
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             print(f"Image will be processed by model at effective dimensions: {model_input_width}x{model_input_height}")
         else:
+            # Dummy values for non-master processes
             original_width, original_height, model_input_height, model_input_width = 1, 1, 1, 1
 
         user_instruction = "Find a folder called ui-tars"
@@ -104,6 +101,7 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(device)
 
+        # Convert pixel values to bfloat16
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
@@ -115,6 +113,7 @@ def _mp_fn(index):
                 **inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id
             )
 
+        # Only master process handles output parsing and execution
         if xm.is_master_ordinal():
             input_length = inputs['input_ids'].shape[1]
             generated_ids = output_ids[:, input_length:]
@@ -156,6 +155,7 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
         
+        # Synchronize all processes after each step
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
@@ -163,4 +163,5 @@ def _mp_fn(index):
 
 # --- Launcher for torchrun ---
 if __name__ == '__main__':
-    _mp_fn(0)
+    # Use all available TPU cores
+    xmp.spawn(_mp_fn, nprocs=8)
