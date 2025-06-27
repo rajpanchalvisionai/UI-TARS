@@ -176,4 +176,6 @@ def _mp_fn(index):
 
 # --- This is the new launcher section ---
 if __name__ == '__main__':
-    xmp.spawn(_mp_fn, args=(), nprocs=8, start_method='fork')
+    # torchrun handles spawning, so we just run the main function directly.
+    # The 'index' argument is not used by torchrun but is kept for function signature.
+    _mp_fn(0)
