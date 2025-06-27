@@ -1,5 +1,11 @@
+# --- NEW IMPORTS FOR FSDP PARALLELISM ---
 import torch
-import torch_xla.core.xla_model as xm  # <-- 1. Import torch_xla for TPUAdd commentMore actions
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.fsdp as xla_fsdp
+from torch_xla.distributed.fsdp.wrap import auto_wrap, checkpoint_module_recursively
+# --- END NEW IMPORTS ---
+
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from PIL import Image
 import os
@@ -14,136 +20,114 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from action_parser import parse_action_to_structure_output, parsing_response_to_pyautogui_code, smart_resize
 from prompt import COMPUTER_USE_DOUBAO
 
-# --- Model and Processor Setup ---
-model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
+# --- FSDP PARALLELISM SETUP ---
+# This part of the code now runs on all 8 TPU cores.
+# Each core is a separate process.
 
-# --- 2. GET TPU DEVICE AND LOAD MODEL ---
-# Get the TPU device
-try:
-    print("Acquiring TPU device...")
+def _mp_fn(index):
+    # Get the specific TPU core for this process (e.g., xla:0, xla:1, etc.)
     device = xm.xla_device()
-    print(f"TPU device acquired: {device}")
-except Exception as e:
-    print(f"Error acquiring TPU device: {e}")
-    print("Ensure you are running on a Google Cloud TPU VM and torch_xla is installed.")
-    exit()
 
+    # --- Model and Processor Setup ---
+    model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-# Load processor and model for TPU
-try:
-    print("Attempting to load processor and model for TPU...")
-    processor = AutoProcessor.from_pretrained(model_name, use_fast=False)  # Match saved model's processor
+    # --- Load Model and Shard with FSDP ---
+    if xm.is_master_ordinal():
+        print("Master process loading processor...")
+    processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+    
+    # Define a policy for how to shard the model layers
+    # This tells FSDP to automatically wrap the transformer blocks.
+    fsdp_policy = auto_wrap(checkpoint_module_recursively)
 
-    # Load the model WITHOUT any GPU-specific configurations.
-    # TPUs work best with bfloat16 precision.
+    if xm.is_master_ordinal():
+        print("Master process loading model for sharding...")
+    
+    # Load the model with bfloat16 for TPU performance
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,  # Use bfloat16 for better TPU performance
+        torch_dtype=torch.bfloat16,
     )
     
-    # Explicitly move the model to the TPU device
-    print("Moving model to TPU device...")
+    # --- THIS IS THE KEY CHANGE ---
+    # Wrap the model with XlaFSDP to shard it across all cores
+    # This solves the vmem memory issue.
+    if xm.is_master_ordinal():
+        print("Applying FSDP and sharding the model across all 8 cores...")
+    
+    model = xla_fsdp.XlaFSDP(model, auto_wrap_policy=fsdp_policy)
+    
+    # Move the sharded model to the TPU devices
     model.to(device)
+    model.eval()
 
-    model.eval()  # Set model to evaluation mode
-    print("Model and processor loaded successfully and moved to TPU.")
-except Exception as e:
-    print(f"Error loading model or processor: {e}")
-    print("-" * 50)
-    print("TROUBLESHOOTING TPU LOADING:")
-    print("Ensure you have installed torch and torch_xla correctly.")
-    print("Installation command: pip install torch torch_xla[tpu] -f https://storage.googleapis.com/libtpu-releases/index.html")
-    print("Check your internet connection for downloading model weights.")
-    print("-" * 50)
-    exit()
+    # Wait for all processes to finish model loading and sharding
+    xm.rendezvous('model_ready')
+    if xm.is_master_ordinal():
+        print("Model sharded and ready on all cores.")
 
-# --- Configuration ---
-COORDINATE_PARSING_FACTOR = 1000
+    # --- Configuration ---
+    COORDINATE_PARSING_FACTOR = 1000
 
-# --- Main Agent Loop ---
-def run_ui_agent(user_instruction, max_steps=10):
-    """
-    Runs the UI agent for a given instruction.
-
-    Args:
-        user_instruction (str): The task the agent needs to perform.
-        max_steps (int): Maximum number of steps to execute.
-    """
-    print(f"\n--- Starting UI Agent ---")
-    print(f"Task: {user_instruction}")
-
-    conversation_history = []
-
+    # --- Main Agent Loop ---
+    # The loop runs forever, but only the main process (rank 0) interacts with the GUI.
+    max_steps = 20
     for step in range(max_steps):
-        print(f"\n--- Step {step + 1}/{max_steps} ---")
-
-        try:
-            # 1. Take Screenshot
+        # --- CRITICAL: Only the main process (rank 0) should interact with the GUI ---
+        if xm.is_master_ordinal():
+            print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
             img = screenshot
+        else:
+            # Other processes will wait with a placeholder image
+            img = Image.new('RGB', (100, 100))
 
-            # Get original dimensions
+        # --- Broadcast Screenshot to all cores ---
+        # The main process sends its screenshot to all other processes
+        # so they can all participate in the computation.
+        object_list = [img]
+        torch.distributed.broadcast_object_list(object_list, src=0)
+        img = object_list[0]
+        # --- End Broadcast ---
+
+        if xm.is_master_ordinal():
             original_width, original_height = img.size
             print(f"Screenshot taken. Original dimensions: {original_width}x{original_height}")
-
-            # Calculate dimensions the model *would have seen* after smart resizing
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             print(f"Image will be processed by model at effective dimensions: {model_input_width}x{model_input_height}")
+        else:
+            # Other processes just need placeholder values
+            original_width, original_height = 1, 1
+            model_input_height, model_input_width = 1, 1
 
-            # 2. Format Prompt
-            formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
+        user_instruction = "Find a folder called ui-tars"
+        formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
 
-            # 3. Prepare Conversation Structure
-            full_conversation = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "image": img
-                        },
-                        {
-                            "type": "text",
-                            "text": formatted_prompt_text
-                        }
-                    ]
-                }
-            ]
+        full_conversation = [
+            {"role": "user", "content": [{"type": "image", "image": img}, {"type": "text", "text": formatted_prompt_text}]}
+        ]
 
-            # 4. Process Input & Generate
+        if xm.is_master_ordinal():
             print("Applying chat template and tokenizing...")
-            inputs = processor.apply_chat_template(
-                full_conversation,
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt"
-            ).to(device)  # <-- IMPORTANT: Move input tensors to the TPU device
+        inputs = processor.apply_chat_template(
+            full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+        ).to(device)
 
-            # Ensure the image tensor dtype matches the model's dtype to save memory
-            if 'pixel_values' in inputs:
-                inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
-            
-            # Debug: Check input tokens
-            print(f"Input tokens shape: {inputs['input_ids'].shape}")
-            if 'pixel_values' in inputs:
-                print(f"Pixel values shape: {inputs['pixel_values'].shape}, dtype: {inputs['pixel_values'].dtype}")
+        if 'pixel_values' in inputs:
+            inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
-            print("Generating response...")
-            with torch.no_grad():
-                # Use xm.mark_step() for better performance, tells XLA to execute the graph
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=500,
-                    do_sample=False,
-                    pad_token_id=processor.tokenizer.eos_token_id
-                )
-                xm.mark_step()
-                
-            print("Response generated.")
+        if xm.is_master_ordinal():
+            print("Generating response on all cores...")
+        
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id
+            )
 
-            # Decode the generated output
+        # The output (output_ids) is now present on all cores.
+        # We only need the main process to decode and execute it.
+        if xm.is_master_ordinal():
             input_length = inputs['input_ids'].shape[1]
             generated_ids = output_ids[:, input_length:]
             raw_model_output_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)[0]
@@ -151,8 +135,6 @@ def run_ui_agent(user_instruction, max_steps=10):
             print(raw_model_output_text)
             print("------------------------")
 
-            # 5. Parse Action from Output
-            print("Parsing action from model output...")
             parsed_actions = parse_action_to_structure_output(
                 raw_model_output_text,
                 factor=COORDINATE_PARSING_FACTOR,
@@ -160,17 +142,13 @@ def run_ui_agent(user_instruction, max_steps=10):
                 origin_resized_width=model_input_width,
                 model_type="qwen25vl"
             )
-            print("Action parsed.")
 
             if not parsed_actions:
                 print("No valid action parsed. Stopping.")
                 break
 
-            # 6. Convert to PyAutoGUI code & Execute
             pyautogui_code = parsing_response_to_pyautogui_code(
-                parsed_actions,
-                image_height=original_height,
-                image_width=original_width
+                parsed_actions, image_height=original_height, image_width=original_width
             )
 
             print("\n--- Generated PyAutoGUI Code ---")
@@ -189,14 +167,13 @@ def run_ui_agent(user_instruction, max_steps=10):
             except Exception as e:
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
+        
+        # All processes must wait here to stay in sync before the next step.
+        xm.rendezvous('step_complete')
 
-        except Exception as e:
-            print(f"An error occurred during step {step + 1}: {e}")
-            break
+    if xm.is_master_ordinal():
+        print("\n--- UI Agent Finished ---")
 
-    print("\n--- UI Agent Finished ---")
-
-# --- How to Run ---
-if __name__ == "__main__":
-    user_task = "Find a folder called ui-tars"
-    run_ui_agent(user_task, max_steps=20)
+# --- This is the new launcher section ---
+if __name__ == '__main__':
+    xmp.spawn(_mp_fn, args=(), nprocs=8, start_method='fork')
