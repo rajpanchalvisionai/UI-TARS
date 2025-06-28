@@ -1,11 +1,12 @@
-# --- MODIFIED IMPORTS FOR MODERN FSDP ---
+# --- FINAL WORKING IMPORTS ---
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+# This is the correct underlying attention class you found.
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
-# --- END MODIFIED IMPORTS ---
+# --- END IMPORTS ---
 
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
 from PIL import Image
@@ -21,12 +22,14 @@ from action_parser import parse_action_to_structure_output, parsing_response_to_
 from prompt import COMPUTER_USE_DOUBAO
 
 
-def qwen_fsdp_policy(module, recurse, nonwrapped_numel):
-    # Pass the transformer_layer_cls explicitly
+# --- THIS IS THE CORRECTED POLICY FUNCTION ---
+# The only change is renaming 'nonwrapped_numel' to 'unwrapped_params' to match what FSDP expects.
+def qwen_fsdp_policy(module, recurse, unwrapped_params):
     return transformer_auto_wrap_policy(
-        module, recurse, nonwrapped_numel,
+        module, recurse, unwrapped_params,
         transformer_layer_cls={Qwen2Attention}
     )
+# --- END CORRECTION ---
 
 
 # --- FSDP PARALLELISM SETUP ---
@@ -38,7 +41,6 @@ def _mp_fn(index):
         print("Master process loading processor...")
     processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
    
-
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
     
@@ -50,6 +52,7 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
     
+    # This call is now correct because our policy function has the right signature.
     model = XlaFullyShardedDataParallel(
         model, 
         auto_wrap_policy=qwen_fsdp_policy
@@ -74,7 +77,6 @@ def _mp_fn(index):
         else:
             img = Image.new('RGB', (100, 100))
 
-        # Broadcast screenshot to all cores
         object_list = [img]
         torch.distributed.broadcast_object_list(object_list, src=0)
         img = object_list[0]
@@ -85,7 +87,6 @@ def _mp_fn(index):
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             print(f"Image will be processed by model at effective dimensions: {model_input_width}x{model_input_height}")
         else:
-            # Dummy values for non-master processes
             original_width, original_height, model_input_height, model_input_width = 1, 1, 1, 1
 
         user_instruction = "Find a folder called ui-tars"
@@ -101,7 +102,6 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(device)
 
-        # Convert pixel values to bfloat16
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
@@ -113,7 +113,6 @@ def _mp_fn(index):
                 **inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id
             )
 
-        # Only master process handles output parsing and execution
         if xm.is_master_ordinal():
             input_length = inputs['input_ids'].shape[1]
             generated_ids = output_ids[:, input_length:]
@@ -155,13 +154,12 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
         
-        # Synchronize all processes after each step
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
         print("\n--- UI Agent Finished ---")
 
-# --- Launcher for torchrun ---
+# --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
-    # Use all available TPU cores
+    # You were correct to use xmp.spawn() for this setup.
     xmp.spawn(_mp_fn)
