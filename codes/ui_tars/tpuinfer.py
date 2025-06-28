@@ -1,6 +1,5 @@
 # --- FINAL WORKING IMPORTS ---
 import torch
-import torch.distributed as dist # <-- Import the distributed library
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
@@ -31,12 +30,7 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # --- THIS IS THE FINAL FIX ---
-    # Initialize the process group for communication.
-    # The 'xla' backend is used for communication between TPU cores.
-    dist.init_process_group('xla')
-    # --- END FIX ---
-
+    # NOTE: DO NOT add dist.init_process_group here. xmp.spawn handles it.
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -47,6 +41,7 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
     
+    # Load the model in its default float32 precision, as required by the FSDP wrapper.
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name,
     )
@@ -78,9 +73,10 @@ def _mp_fn(index):
         else:
             img = Image.new('RGB', (100, 100))
 
+        # We must still use torch.distributed for communication,
+        # but it will be initialized correctly by xmp.spawn.
         object_list = [img]
-        # This broadcast will now succeed because the process group is initialized.
-        dist.broadcast_object_list(object_list, src=0)
+        torch.distributed.broadcast_object_list(object_list, src=0)
         img = object_list[0]
 
         if xm.is_master_ordinal():
@@ -104,6 +100,7 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(device)
 
+        # We STILL convert the inputs to bfloat16 for efficient computation on the TPU.
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
@@ -163,4 +160,5 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
+    # You were correct to use xmp.spawn() for this setup.
     xmp.spawn(_mp_fn)
