@@ -20,6 +20,15 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from action_parser import parse_action_to_structure_output, parsing_response_to_pyautogui_code, smart_resize
 from prompt import COMPUTER_USE_DOUBAO
 
+
+def qwen_fsdp_policy(module, recurse, nonwrapped_numel):
+    # Pass the transformer_layer_cls explicitly
+    return transformer_auto_wrap_policy(
+        module, recurse, nonwrapped_numel,
+        transformer_layer_cls={Qwen2Attention}
+    )
+
+
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
     device = xm.xla_device()
@@ -28,12 +37,7 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Master process loading processor...")
     processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-    
-    # CORRECT POLICY DEFINITION (using functools.partial)
-    qwen_fsdp_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={Qwen2Attention}
-    )
+   
 
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
