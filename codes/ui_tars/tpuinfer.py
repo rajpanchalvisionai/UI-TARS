@@ -1,5 +1,6 @@
 # --- FINAL WORKING IMPORTS ---
 import torch
+import torch.distributed as dist # <-- Import the distributed library
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
@@ -30,6 +31,12 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
+    # --- THIS IS THE FINAL FIX ---
+    # Initialize the process group for communication.
+    # The 'xla' backend is used for communication between TPU cores.
+    dist.init_process_group('xla')
+    # --- END FIX ---
+
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -40,14 +47,9 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
     
-    # --- THIS IS THE FINAL KEY CHANGE ---
-    # Load the model in its default float32 precision, as required by the FSDP wrapper.
-    # We will cast the INPUTS to bfloat16 later for performance.
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name,
-        # torch_dtype=torch.bfloat16, # <-- REMOVE THIS LINE
     )
-    # --- END CHANGE ---
     
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
@@ -77,7 +79,8 @@ def _mp_fn(index):
             img = Image.new('RGB', (100, 100))
 
         object_list = [img]
-        torch.distributed.broadcast_object_list(object_list, src=0)
+        # This broadcast will now succeed because the process group is initialized.
+        dist.broadcast_object_list(object_list, src=0)
         img = object_list[0]
 
         if xm.is_master_ordinal():
@@ -101,7 +104,6 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(device)
 
-        # We STILL convert the inputs to bfloat16 for efficient computation on the TPU.
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
