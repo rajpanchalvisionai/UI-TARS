@@ -29,16 +29,11 @@ def _mp_fn(index):
         print("Master process loading processor...")
     processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
     
-    # Create a custom wrapper that matches XLA FSDP's expected signature
-    def custom_auto_wrap_policy(module, recurse, unwrapped_params, **kwargs):
-        """Wrapper to handle XLA FSDP's argument passing"""
-        # Call the original policy with valid arguments
-        return transformer_auto_wrap_policy(
-            module,
-            recurse,
-            transformer_layer_cls={Qwen2Attention},
-            **kwargs
-        )
+    # CORRECT POLICY DEFINITION (using functools.partial)
+    qwen_fsdp_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={Qwen2Attention}
+    )
 
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
@@ -51,10 +46,9 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
     
-    # Use the custom wrapper policy
     model = XlaFullyShardedDataParallel(
         model, 
-        auto_wrap_policy=custom_auto_wrap_policy
+        auto_wrap_policy=qwen_fsdp_policy
     )
     
     model.to(device)
