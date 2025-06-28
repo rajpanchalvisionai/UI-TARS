@@ -2,7 +2,7 @@
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-import torch_xla.distributed.fsdp as xla_fsdp
+from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel  # Correct import
 import functools
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 # Use the correct attention class name
@@ -25,21 +25,16 @@ from prompt import COMPUTER_USE_DOUBAO
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
     device = xm.xla_device()
-
-    # --- Model and Processor Setup ---
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # --- Load Model and Shard with FSDP ---
     if xm.is_master_ordinal():
         print("Master process loading processor...")
     processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
     
-    # Use the correct attention class
+    # Correct attention class
     qwen_fsdp_policy = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            Qwen2Attention,  # CORRECT CLASS NAME
-        },
+        transformer_layer_cls={Qwen2Attention},
     )
 
     if xm.is_master_ordinal():
@@ -53,7 +48,11 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
     
-    model = xla_fsdp.XlaFSDP(model, auto_wrap_policy=qwen_fsdp_policy)
+    # CORRECTED CLASS NAME
+    model = XlaFullyShardedDataParallel(  # Changed from xla_fsdp.XlaFSDP
+        model, 
+        auto_wrap_policy=qwen_fsdp_policy
+    )
     
     model.to(device)
     model.eval()
