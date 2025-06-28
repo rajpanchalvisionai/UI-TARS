@@ -1,7 +1,7 @@
 # --- FINAL WORKING IMPORTS ---
 import torch
+import torch.distributed as dist # <-- The key import for communication
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
@@ -30,7 +30,11 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # NOTE: DO NOT add dist.init_process_group here. xmp.spawn handles it.
+    # --- The Correct Initialization for torchrun ---
+    # `torchrun` sets the RANK env var, so this call will now succeed.
+    dist.init_process_group('xla')
+    # --- End Initialization ---
+
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -41,7 +45,6 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
     
-    # Load the model in its default float32 precision, as required by the FSDP wrapper.
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name,
     )
@@ -73,10 +76,9 @@ def _mp_fn(index):
         else:
             img = Image.new('RGB', (100, 100))
 
-        # We must still use torch.distributed for communication,
-        # but it will be initialized correctly by xmp.spawn.
         object_list = [img]
-        torch.distributed.broadcast_object_list(object_list, src=0)
+        # This broadcast will now succeed because the group is initialized.
+        dist.broadcast_object_list(object_list, src=0)
         img = object_list[0]
 
         if xm.is_master_ordinal():
@@ -100,7 +102,6 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(device)
 
-        # We STILL convert the inputs to bfloat16 for efficient computation on the TPU.
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
@@ -158,7 +159,7 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("\n--- UI Agent Finished ---")
 
-# --- Launcher for xmp.spawn ---
+# --- Launcher for torchrun ---
+# This makes the script compatible with the torchrun launcher
 if __name__ == '__main__':
-    # You were correct to use xmp.spawn() for this setup.
-    xmp.spawn(_mp_fn)
+    _mp_fn(0)
