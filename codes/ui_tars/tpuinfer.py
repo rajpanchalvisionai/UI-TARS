@@ -4,7 +4,6 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-# This is the correct underlying attention class you found.
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 # --- END IMPORTS ---
 
@@ -22,14 +21,11 @@ from action_parser import parse_action_to_structure_output, parsing_response_to_
 from prompt import COMPUTER_USE_DOUBAO
 
 
-# --- THIS IS THE CORRECTED POLICY FUNCTION ---
-# The only change is renaming 'nonwrapped_numel' to 'unwrapped_params' to match what FSDP expects.
 def qwen_fsdp_policy(module, recurse, unwrapped_params):
     return transformer_auto_wrap_policy(
         module, recurse, unwrapped_params,
         transformer_layer_cls={Qwen2Attention}
     )
-# --- END CORRECTION ---
 
 
 # --- FSDP PARALLELISM SETUP ---
@@ -44,15 +40,18 @@ def _mp_fn(index):
     if xm.is_master_ordinal():
         print("Master process loading model for sharding...")
     
+    # --- THIS IS THE FINAL KEY CHANGE ---
+    # Load the model in its default float32 precision, as required by the FSDP wrapper.
+    # We will cast the INPUTS to bfloat16 later for performance.
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        # torch_dtype=torch.bfloat16, # <-- REMOVE THIS LINE
     )
+    # --- END CHANGE ---
     
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
     
-    # This call is now correct because our policy function has the right signature.
     model = XlaFullyShardedDataParallel(
         model, 
         auto_wrap_policy=qwen_fsdp_policy
@@ -102,6 +101,7 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(device)
 
+        # We STILL convert the inputs to bfloat16 for efficient computation on the TPU.
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
@@ -161,5 +161,4 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
-    # You were correct to use xmp.spawn() for this setup.
     xmp.spawn(_mp_fn)
