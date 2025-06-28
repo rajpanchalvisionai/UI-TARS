@@ -164,4 +164,4 @@ def _mp_fn(index):
 # --- Launcher for torchrun ---
 if __name__ == '__main__':
     # Use all available TPU cores
-    xmp.spawn(_mp_fn, nprocs=8)
+    xmp.spawn(_mp_fn)
