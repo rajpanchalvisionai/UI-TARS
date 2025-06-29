@@ -30,7 +30,13 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # NOTE: No dist.init_process_group. xmp.spawn handles the context.
+    # --- The "Magic Handshake" ---
+    # On this specific OS image, every process must interact with the GUI
+    # once *before* initializing the TPU to inherit the correct permissions.
+    # This call is for setup only; its output is discarded.
+    pyautogui.size()
+    # --- End Magic Handshake ---
+
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -40,7 +46,6 @@ def _mp_fn(index):
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
     else:
-        # Others wait, then load from cache.
         xm.rendezvous('download_done')
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
@@ -69,7 +74,7 @@ def _mp_fn(index):
         tensors_to_broadcast = []
         screenshot_size = (0, 0)
         
-        # Master process handles GUI and preprocessing.
+        # Master process handles the REAL GUI interaction and preprocessing.
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
@@ -80,32 +85,23 @@ def _mp_fn(index):
             formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
             full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
             
-            # Add attention_mask for best practice
             inputs = processor.apply_chat_template(
                 full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
                 padding=True, return_attention_mask=True
             )
-            # This is the list of TENSORS we will broadcast.
-            # They are still on the CPU at this point.
             tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values'], inputs['attention_mask']]
         else:
-            # Other processes create empty placeholders to receive the broadcasted data.
-            # We don't know the sequence length, so we use a generous fixed size.
+            # Other processes create empty placeholders.
             tensors_to_broadcast = [
                 torch.empty((1, 2048), dtype=torch.long), 
                 torch.empty((1, 3, 336, 336), dtype=torch.float32),
                 torch.empty((1, 2048), dtype=torch.long)
             ]
 
-        # --- THIS IS THE FINAL FIX ---
         # The master sends its CPU tensors, and the other processes receive them on their CPU.
-        # This avoids the (cpu vs. xla) error.
         xm.collective_broadcast(tensors_to_broadcast)
         
-        # --- End Fix ---
-
-        # All processes now have the same tensors on their CPU.
-        # They can now move them to their own TPU core.
+        # All processes now have the same tensors and move them to their own TPU core.
         inputs = {
             'input_ids': tensors_to_broadcast[0].to(device), 
             'pixel_values': tensors_to_broadcast[1].to(device).to(torch.bfloat16),
@@ -126,6 +122,7 @@ def _mp_fn(index):
             original_width, original_height = screenshot_size
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             
+            # We don't need to skip special tokens for the raw output of generate
             raw_model_output_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
             print("\n--- Raw Model Output ---")
             print(raw_model_output_text)
