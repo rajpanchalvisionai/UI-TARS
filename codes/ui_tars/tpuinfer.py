@@ -1,6 +1,5 @@
 # --- FINAL WORKING IMPORTS ---
 import torch
-import torch.distributed as dist
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
@@ -31,27 +30,24 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # This is the correct initialization sequence you discovered.
-    dist.init_process_group('xla')
-
+    # NOTE: No dist.init_process_group. xmp.spawn handles the context.
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # To save memory, only the master process loads the model from disk.
+    # All processes must define the model structure, but only the master loads the weights.
+    # To save memory and prevent race conditions, we load on CPU first, then shard.
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
     else:
-        processor = None
-        model = None
-    
-    # The master sends the loaded model and processor to all other processes.
-    object_list = [model, processor]
-    dist.broadcast_object_list(object_list, src=0)
-    model, processor = object_list
-    
-    # Now that every process has the model, they all participate in sharding.
+        # The other processes wait for the master to load, then they will get the weights during sharding.
+        # We still need to define the model structure on all processes.
+        # The easiest way is to let them all load it. The OS will cache the files.
+        processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
+
+    # All processes participate in sharding.
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
     
@@ -63,26 +59,22 @@ def _mp_fn(index):
     model.to(device)
     model.eval()
 
-    xm.rendezvous('model_ready')
+    xm.rendezvous('model_ready') # Wait for all processes to finish sharding.
     if xm.is_master_ordinal():
         print("Model sharded and ready on all cores.")
 
     # --- MAIN AGENT LOOP ---
     max_steps = 20
     for step in range(max_steps):
-        # We need a placeholder for the screenshot on non-master nodes
-        screenshot = None
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
-            print("Taking screenshot...")
-            screenshot = pyautogui.screenshot()
+
+        # --- NO MORE COMMUNICATION ---
+        # Every process takes its own screenshot. They will be identical.
+        print(f"Process {index} taking screenshot...")
+        screenshot = pyautogui.screenshot()
         
-        # We must broadcast the raw screenshot object first
-        object_list = [screenshot]
-        dist.broadcast_object_list(object_list, src=0)
-        screenshot = object_list[0]
-        
-        # Now every process can process the screenshot to get inputs
+        # Every process does its own pre-processing.
         user_instruction = "Find a folder called ui-tars"
         formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
         full_conversation = [
@@ -92,12 +84,12 @@ def _mp_fn(index):
             full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         )
 
-        # Move tensors to device and set correct dtype for computation
+        # Move tensors to device and set correct dtype.
         inputs = {k: v.to(device) for k, v in inputs.items()}
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
-        # --- GENERATION (All Processes) ---
+        # --- GENERATION (All Processes Participate) ---
         if xm.is_master_ordinal():
             print("Generating response on all cores...")
         
@@ -107,6 +99,7 @@ def _mp_fn(index):
             )
 
         # --- EXECUTION (Main Process Only) ---
+        # Only the master process acts on the result. The others just wait.
         if xm.is_master_ordinal():
             original_width, original_height = screenshot.size
             model_input_height, model_input_width = smart_resize(original_height, original_width)
@@ -121,9 +114,11 @@ def _mp_fn(index):
             if not parsed_actions:
                 print("No valid action parsed. Stopping.")
                 break
+
             pyautogui_code = parsing_response_to_pyautogui_code(parsed_actions, original_height, original_width)
             print("\n--- Generated PyAutoGUI Code ---")
             print(pyautogui_code)
+            
             if pyautogui_code.strip() == "DONE":
                 print("Task finished by agent.")
                 break
@@ -137,6 +132,7 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
 
+        # All processes wait here to stay in sync before the next step.
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
@@ -145,6 +141,5 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
-    # You were correct to use xmp.spawn(). We remove nprocs to use the default,
-    # which automatically spawns a process for every available TPU core.
+    # We use the default nprocs=None to let xmp use all available cores.
     xmp.spawn(_mp_fn)
