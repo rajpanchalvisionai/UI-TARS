@@ -34,23 +34,20 @@ def _mp_fn(index):
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # All processes define the model structure.
-    # To save memory and prevent race conditions, we load on CPU first.
+    # To save memory, only the master process downloads the model.
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
     else:
-        # The other processes wait for the master to load.
-        # This prevents multiple processes from writing to the cache at once.
+        # Other processes wait for the master to download.
         xm.rendezvous('download_done')
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
 
     if xm.is_master_ordinal():
-        xm.rendezvous('download_done') # Master signals that download is complete.
+        xm.rendezvous('download_done') # Master signals download is complete.
         
-    # All processes participate in sharding.
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
     
@@ -81,19 +78,21 @@ def _mp_fn(index):
             inputs = processor.apply_chat_template(
                 full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
             )
-            # This is the list of TENSORS we will broadcast
-            tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values']]
+            tensors_to_broadcast = [inputs['input_ids'].to(device), inputs['pixel_values'].to(device)]
         else:
-            # Other processes create empty placeholders to receive the broadcasted data
-            # The shapes must match what the master process will send.
-            tensors_to_broadcast = [torch.empty((1, 1342), dtype=torch.long), torch.empty((1, 3, 336, 336), dtype=torch.float32)]
+            # --- THIS IS THE FINAL FIX ---
+            # Other processes create empty placeholders DIRECTLY ON THE TPU DEVICE.
+            tensors_to_broadcast = [
+                torch.empty((1, 1342), dtype=torch.long, device=device), 
+                torch.empty((1, 3, 336, 336), dtype=torch.float32, device=device)
+            ]
+            # --- END FIX ---
 
-        # --- BROADCAST THE TENSORS ---
-        # xm.collective_broadcast works because we are sending tensors, not Image objects.
+        # The broadcast will now succeed because all tensors are on the TPU.
         xm.collective_broadcast(tensors_to_broadcast)
         
-        # All processes reassemble the `inputs` dictionary from the broadcasted tensors
-        inputs = {'input_ids': tensors_to_broadcast[0].to(device), 'pixel_values': tensors_to_broadcast[1].to(device).to(torch.bfloat16)}
+        # All processes reassemble the `inputs` dictionary
+        inputs = {'input_ids': tensors_to_broadcast[0], 'pixel_values': tensors_to_broadcast[1].to(torch.bfloat16)}
 
         # --- GENERATION (All Processes Participate) ---
         if xm.is_master_ordinal():
@@ -106,7 +105,7 @@ def _mp_fn(index):
 
         # --- EXECUTION (Main Process Only) ---
         if xm.is_master_ordinal():
-            original_width, original_height = 1024, 768 # Use known/fixed size for now
+            original_width, original_height = 1024, 768
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             
             input_length = inputs['input_ids'].shape[1]
