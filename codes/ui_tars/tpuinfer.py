@@ -1,10 +1,10 @@
-# --- FINAL MODERN IMPORTS ---
+# --- FINAL WORKING IMPORTS ---
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor.parallel import parallelize_module
-import torch_xla.runtime as runtime # <-- The final, correct import
+from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 # --- END IMPORTS ---
 
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -20,71 +20,93 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from action_parser import parse_action_to_structure_output, parsing_response_to_pyautogui_code, smart_resize
 from prompt import COMPUTER_USE_DOUBAO
 
-# --- TENSOR PARALLELISM SETUP ---
+
+def qwen_fsdp_policy(module, recurse, unwrapped_params):
+    return transformer_auto_wrap_policy(
+        module, recurse, unwrapped_params,
+        transformer_layer_cls={Qwen2Attention}
+    )
+
+
+# --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # This launcher function is run on each of the 8 TPU cores.
+    # NOTE: No dist.init_process_group. xmp.spawn handles the context.
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # --- THIS IS THE MODERN API FOR SHARDING ---
-    # 1. Create a Device Mesh
-    # We get the number of devices using the modern runtime.world_size() function.
-    world_size = runtime.world_size()
-    device_mesh = init_device_mesh("xla", (world_size,))
-
-    # 2. Load Model on CPU
+    # All processes define the model structure.
+    # To save memory and prevent race conditions, we load on CPU first.
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
-        model.eval()
     else:
-        from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_name)
-        model = Qwen2_5_VLForConditionalGeneration(config)
+        # The other processes wait for the master to load.
+        # This prevents multiple processes from writing to the cache at once.
+        xm.rendezvous('download_done')
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-        model.eval()
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
 
-    # 3. Shard the Model
     if xm.is_master_ordinal():
-        print("Applying modern Tensor Parallelism and sharding the model...")
-
-    model = parallelize_module(model, device_mesh)
+        xm.rendezvous('download_done') # Master signals that download is complete.
+        
+    # All processes participate in sharding.
+    if xm.is_master_ordinal():
+        print("Applying FSDP and sharding the model across all TPU cores...")
+    
+    model = XlaFullyShardedDataParallel(
+        model, 
+        auto_wrap_policy=qwen_fsdp_policy
+    )
+    
     model.to(device)
+    model.eval()
 
-    xm.rendezvous('model_ready')
+    xm.rendezvous('model_ready') # Wait for all processes to finish sharding.
     if xm.is_master_ordinal():
-        print("Model sharded with modern API and ready on all cores.")
+        print("Model sharded and ready on all cores.")
 
     # --- MAIN AGENT LOOP ---
     max_steps = 20
     for step in range(max_steps):
-        screenshot = None
+        # Master process handles the GUI and preprocessing
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
+            
+            user_instruction = "Find a folder called ui-tars"
+            formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
+            full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
+            inputs = processor.apply_chat_template(
+                full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+            )
+            # This is the list of TENSORS we will broadcast
+            tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values']]
+        else:
+            # Other processes create empty placeholders to receive the broadcasted data
+            # The shapes must match what the master process will send.
+            tensors_to_broadcast = [torch.empty((1, 1342), dtype=torch.long), torch.empty((1, 3, 336, 336), dtype=torch.float32)]
 
-        screenshot_list = [screenshot]
-        xm.collective_broadcast(screenshot_list)
-        screenshot = screenshot_list[0]
+        # --- BROADCAST THE TENSORS ---
+        # xm.collective_broadcast works because we are sending tensors, not Image objects.
+        xm.collective_broadcast(tensors_to_broadcast)
         
-        user_instruction = "Find a folder called ui-tars"
-        formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
-        full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
-        inputs = processor.apply_chat_template(full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        if 'pixel_values' in inputs:
-            inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
+        # All processes reassemble the `inputs` dictionary from the broadcasted tensors
+        inputs = {'input_ids': tensors_to_broadcast[0].to(device), 'pixel_values': tensors_to_broadcast[1].to(device).to(torch.bfloat16)}
 
+        # --- GENERATION (All Processes Participate) ---
         if xm.is_master_ordinal():
             print("Generating response on all cores...")
         
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
+            output_ids = model.generate(
+                **inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id
+            )
 
+        # --- EXECUTION (Main Process Only) ---
         if xm.is_master_ordinal():
-            original_width, original_height = screenshot.size
+            original_width, original_height = 1024, 768 # Use known/fixed size for now
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             
             input_length = inputs['input_ids'].shape[1]
@@ -97,6 +119,7 @@ def _mp_fn(index):
             if not parsed_actions:
                 print("No valid action parsed. Stopping.")
                 break
+
             pyautogui_code = parsing_response_to_pyautogui_code(parsed_actions, original_height, original_width)
             print("\n--- Generated PyAutoGUI Code ---")
             print(pyautogui_code)
@@ -114,6 +137,7 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
 
+        # All processes wait here to stay in sync
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
@@ -122,4 +146,5 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
+    # We use the default nprocs=None to let xmp use all available cores.
     xmp.spawn(_mp_fn)
