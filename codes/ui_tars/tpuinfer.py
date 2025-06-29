@@ -31,35 +31,26 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # NOTE: xmp.spawn handles all necessary initialization.
-    # We DO NOT call dist.init_process_group ourselves.
-    device = xm.xla_device()
-    
-    # We must initialize torch.distributed to use the broadcast function,
-    # but we do it *after* xmp has set up the world.
+    # This is the correct initialization sequence you discovered.
     dist.init_process_group('xla')
 
+    device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # --- MODEL LOADING (Main Process Only) ---
     # To save memory, only the master process loads the model from disk.
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
     else:
-        # Other processes wait for the master.
         processor = None
         model = None
     
-    # --- BROADCAST MODEL & PROCESSOR ---
     # The master sends the loaded model and processor to all other processes.
-    # This ensures every process has an identical copy before sharding.
     object_list = [model, processor]
     dist.broadcast_object_list(object_list, src=0)
     model, processor = object_list
     
-    # --- FSDP WRAPPING (All Processes) ---
     # Now that every process has the model, they all participate in sharding.
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
@@ -79,33 +70,32 @@ def _mp_fn(index):
     # --- MAIN AGENT LOOP ---
     max_steps = 20
     for step in range(max_steps):
+        # We need a placeholder for the screenshot on non-master nodes
+        screenshot = None
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
-            
-            # --- PRE-PROCESSING (Main Process Only) ---
-            user_instruction = "Find a folder called ui-tars"
-            formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
-            full_conversation = [
-                {"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}
-            ]
-            inputs = processor.apply_chat_template(
-                full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
-            )
-            # Create a list of tensors to broadcast
-            tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values']]
-        else:
-            # Other processes create empty placeholders to receive the broadcasted data
-            tensors_to_broadcast = [torch.empty((1, 1342), dtype=torch.long), torch.empty((1, 3, 336, 336), dtype=torch.float32)]
-
-        # --- BROADCAST TENSORS ---
-        # The master sends the processed input_ids and pixel_values to all other processes.
-        dist.broadcast(tensors_to_broadcast[0], src=0)
-        dist.broadcast(tensors_to_broadcast[1], src=0)
         
-        # All processes reassemble the `inputs` dictionary
-        inputs = {'input_ids': tensors_to_broadcast[0].to(device), 'pixel_values': tensors_to_broadcast[1].to(device).to(torch.bfloat16)}
+        # We must broadcast the raw screenshot object first
+        object_list = [screenshot]
+        dist.broadcast_object_list(object_list, src=0)
+        screenshot = object_list[0]
+        
+        # Now every process can process the screenshot to get inputs
+        user_instruction = "Find a folder called ui-tars"
+        formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
+        full_conversation = [
+            {"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}
+        ]
+        inputs = processor.apply_chat_template(
+            full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+        )
+
+        # Move tensors to device and set correct dtype for computation
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        if 'pixel_values' in inputs:
+            inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
         # --- GENERATION (All Processes) ---
         if xm.is_master_ordinal():
@@ -127,17 +117,25 @@ def _mp_fn(index):
             print("\n--- Raw Model Output ---")
             print(raw_model_output_text)
 
-            # ... (rest of your parsing and pyautogui execution code, which is already correct) ...
             parsed_actions = parse_action_to_structure_output(raw_model_output_text, 1000, model_input_height, model_input_width, "qwen25vl")
             if not parsed_actions:
+                print("No valid action parsed. Stopping.")
                 break
             pyautogui_code = parsing_response_to_pyautogui_code(parsed_actions, original_height, original_width)
             print("\n--- Generated PyAutoGUI Code ---")
             print(pyautogui_code)
             if pyautogui_code.strip() == "DONE":
+                print("Task finished by agent.")
                 break
-            exec(pyautogui_code)
-            time.sleep(2)
+            
+            print("Executing PyAutoGUI code...")
+            try:
+                exec(pyautogui_code)
+                print("Code executed. Waiting a moment...")
+                time.sleep(2)
+            except Exception as e:
+                print(f"Error executing PyAutoGUI code: {e}")
+                break
 
         xm.rendezvous('step_complete')
 
@@ -147,5 +145,6 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
-    # You were correct to use xmp.spawn() for this setup.
-    xmp.spawn(_mp_fn, nprocs=8)
+    # You were correct to use xmp.spawn(). We remove nprocs to use the default,
+    # which automatically spawns a process for every available TPU core.
+    xmp.spawn(_mp_fn)
