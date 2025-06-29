@@ -4,6 +4,7 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor.parallel import parallelize_module
+import torch_xla.runtime as runtime # <-- The final, correct import
 # --- END IMPORTS ---
 
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -27,19 +28,17 @@ def _mp_fn(index):
 
     # --- THIS IS THE MODERN API FOR SHARDING ---
     # 1. Create a Device Mesh
-    # We get the number of devices using the modern xm.xrt_world_size() function.
-    world_size = xm.xrt_world_size()
+    # We get the number of devices using the modern runtime.world_size() function.
+    world_size = runtime.world_size()
     device_mesh = init_device_mesh("xla", (world_size,))
 
     # 2. Load Model on CPU
-    # We load on the master process to prevent race conditions.
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
-        model.eval() # Put the model in eval mode before sharding
+        model.eval()
     else:
-        # We need a placeholder structure on other processes.
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(model_name)
         model = Qwen2_5_VLForConditionalGeneration(config)
@@ -53,7 +52,6 @@ def _mp_fn(index):
     model = parallelize_module(model, device_mesh)
     model.to(device)
 
-    # Wait for all processes to finish setup
     xm.rendezvous('model_ready')
     if xm.is_master_ordinal():
         print("Model sharded with modern API and ready on all cores.")
@@ -67,12 +65,10 @@ def _mp_fn(index):
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
 
-        # The master process sends the screenshot to all other processes
         screenshot_list = [screenshot]
         xm.collective_broadcast(screenshot_list)
         screenshot = screenshot_list[0]
         
-        # All processes now have the same screenshot and prepare the inputs
         user_instruction = "Find a folder called ui-tars"
         formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
         full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
@@ -81,14 +77,12 @@ def _mp_fn(index):
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
-        # --- GENERATION WITH TENSOR PARALLELISM ---
         if xm.is_master_ordinal():
             print("Generating response on all cores...")
         
         with torch.no_grad():
             output_ids = model.generate(**inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
 
-        # --- EXECUTION (Main Process Only) ---
         if xm.is_master_ordinal():
             original_width, original_height = screenshot.size
             model_input_height, model_input_width = smart_resize(original_height, original_width)
@@ -120,7 +114,6 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
 
-        # All processes wait here to stay in sync
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
@@ -129,5 +122,4 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
-    # We use the default nprocs=None to let xmp use all available cores.
     xmp.spawn(_mp_fn)
