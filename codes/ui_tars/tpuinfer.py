@@ -27,8 +27,9 @@ def _mp_fn(index):
 
     # --- THIS IS THE MODERN API FOR SHARDING ---
     # 1. Create a Device Mesh
-    # This describes our 8 TPU cores as a single parallel group.
-    device_mesh = init_device_mesh("xla", (xm.xla_device_count(),))
+    # We get the number of devices using the modern xm.xrt_world_size() function.
+    world_size = xm.xrt_world_size()
+    device_mesh = init_device_mesh("xla", (world_size,))
 
     # 2. Load Model on CPU
     # We load on the master process to prevent race conditions.
@@ -36,24 +37,21 @@ def _mp_fn(index):
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
-        # Put the model in eval mode before sharding
-        model.eval()
+        model.eval() # Put the model in eval mode before sharding
     else:
         # We need a placeholder structure on other processes.
-        # Transformers' `from_config` is the most efficient way to do this.
         from transformers import AutoConfig
         config = AutoConfig.from_pretrained(model_name)
         model = Qwen2_5_VLForConditionalGeneration(config)
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+        model.eval()
 
     # 3. Shard the Model
-    # `parallelize_module` is the modern PyTorch function. It automatically
-    # figures out how to split the layers across the device mesh.
     if xm.is_master_ordinal():
         print("Applying modern Tensor Parallelism and sharding the model...")
 
     model = parallelize_module(model, device_mesh)
-    model.to(device) # Move the sharded model to the TPU
+    model.to(device)
 
     # Wait for all processes to finish setup
     xm.rendezvous('model_ready')
@@ -63,7 +61,6 @@ def _mp_fn(index):
     # --- MAIN AGENT LOOP ---
     max_steps = 20
     for step in range(max_steps):
-        # We need a placeholder for the screenshot on non-master nodes
         screenshot = None
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
@@ -71,7 +68,6 @@ def _mp_fn(index):
             screenshot = pyautogui.screenshot()
 
         # The master process sends the screenshot to all other processes
-        # using the xla-native broadcast, which doesn't need init_process_group.
         screenshot_list = [screenshot]
         xm.collective_broadcast(screenshot_list)
         screenshot = screenshot_list[0]
