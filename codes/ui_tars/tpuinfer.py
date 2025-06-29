@@ -30,6 +30,7 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
+    # NOTE: No dist.init_process_group. xmp.spawn handles the context.
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -39,12 +40,13 @@ def _mp_fn(index):
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
     else:
+        # Other processes wait for the master to download.
         xm.rendezvous('download_done')
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
 
     if xm.is_master_ordinal():
-        xm.rendezvous('download_done')
+        xm.rendezvous('download_done') # Master signals download is complete.
         
     if xm.is_master_ordinal():
         print("Applying FSDP and sharding the model across all TPU cores...")
@@ -57,60 +59,58 @@ def _mp_fn(index):
     model.to(device)
     model.eval()
 
-    xm.rendezvous('model_ready')
+    xm.rendezvous('model_ready') # Wait for all processes to finish sharding.
     if xm.is_master_ordinal():
         print("Model sharded and ready on all cores.")
 
     # --- MAIN AGENT LOOP ---
     max_steps = 20
     for step in range(max_steps):
+        # Master process handles the GUI and preprocessing
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
-        else:
-            screenshot = None
-
-        tensors_to_broadcast = []
-        if xm.is_master_ordinal():
+            
             user_instruction = "Find a folder called ui-tars"
             formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
             full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
-            # --- FINAL FIX: ADD ATTENTION MASK ---
             inputs = processor.apply_chat_template(
-                full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
-                padding=True, return_attention_mask=True # Add attention_mask
+                full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
             )
-            tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values'], inputs['attention_mask']]
+            tensors_to_broadcast = [inputs['input_ids'].to(device), inputs['pixel_values'].to(device)]
         else:
+            # --- THIS IS THE FINAL FIX ---
+            # Other processes create empty placeholders DIRECTLY ON THE TPU DEVICE.
             tensors_to_broadcast = [
-                torch.empty((1, 1342), dtype=torch.long), 
-                torch.empty((1, 3, 336, 336), dtype=torch.float32),
-                torch.empty((1, 1342), dtype=torch.long) # Placeholder for attention_mask
+                torch.empty((1, 1342), dtype=torch.long, device=device), 
+                torch.empty((1, 3, 336, 336), dtype=torch.float32, device=device)
             ]
+            # --- END FIX ---
 
+        # The broadcast will now succeed because all tensors are on the TPU.
         xm.collective_broadcast(tensors_to_broadcast)
         
-        inputs = {
-            'input_ids': tensors_to_broadcast[0].to(device), 
-            'pixel_values': tensors_to_broadcast[1].to(device).to(torch.bfloat16),
-            'attention_mask': tensors_to_broadcast[2].to(device) # Use the attention mask
-        }
+        # All processes reassemble the `inputs` dictionary
+        inputs = {'input_ids': tensors_to_broadcast[0], 'pixel_values': tensors_to_broadcast[1].to(torch.bfloat16)}
 
+        # --- GENERATION (All Processes Participate) ---
         if xm.is_master_ordinal():
-            print("Generating response on all cores... (This may take several minutes on the first run)")
+            print("Generating response on all cores...")
         
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id
             )
 
+        # --- EXECUTION (Main Process Only) ---
         if xm.is_master_ordinal():
             original_width, original_height = 1024, 768
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             
-            # We don't need to skip special tokens for the raw output of generate
-            raw_model_output_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            input_length = inputs['input_ids'].shape[1]
+            generated_ids = output_ids[:, input_length:]
+            raw_model_output_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)[0]
             print("\n--- Raw Model Output ---")
             print(raw_model_output_text)
 
@@ -136,6 +136,7 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
 
+        # All processes wait here to stay in sync
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
@@ -144,4 +145,5 @@ def _mp_fn(index):
 
 # --- Launcher for xmp.spawn ---
 if __name__ == '__main__':
+    # We use the default nprocs=None to let xmp use all available cores.
     xmp.spawn(_mp_fn)
