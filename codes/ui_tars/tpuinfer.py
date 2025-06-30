@@ -1,10 +1,10 @@
-# --- FINAL WORKING IMPORTS ---
+# --- FINAL MODERN IMPORTS FOR TENSOR PARALLELISM ---
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor.parallel import parallelize_module
+import torch_xla.runtime as runtime
 # --- END IMPORTS ---
 
 from transformers import AutoTokenizer, Qwen2_5_VLForConditionalGeneration, AutoProcessor
@@ -20,115 +20,85 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from action_parser import parse_action_to_structure_output, parsing_response_to_pyautogui_code, smart_resize
 from prompt import COMPUTER_USE_DOUBAO
 
-
-def qwen_fsdp_policy(module, recurse, unwrapped_params):
-    return transformer_auto_wrap_policy(
-        module, recurse, unwrapped_params,
-        transformer_layer_cls={Qwen2Attention}
-    )
-
-
-# --- FSDP PARALLELISM SETUP ---
+# --- TENSOR PARALLELISM SETUP ---
 def _mp_fn(index):
-    # The "Magic Handshake" to prevent permission errors.
+    # This launcher function is run on each of the 8 TPU cores.
     device = xm.xla_device()
-    torch.randn(1, device=device)
-    xm.mark_step()
-    if xm.is_master_ordinal():
-        print("All processes have successfully initialized their TPU cores.")
-
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # Only master downloads to prevent race conditions.
+    # --- THIS IS THE MODERN API FOR TENSOR PARALLELISM ---
+    # 1. Create a Device Mesh
+    # This describes our 8 TPU cores as a single parallel group.
+    world_size = runtime.world_size()
+    device_mesh = init_device_mesh("xla", (world_size,))
+
+    # 2. Load Model on CPU
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
+        # Load in bfloat16 to save CPU memory before sharding.
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+        model.eval()
     else:
-        xm.rendezvous('download_done')
+        # Other processes create a "meta" model (no memory used)
+        # and will receive the real weights during sharding.
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name)
+        with torch.device('meta'):
+            model = Qwen2_5_VLForConditionalGeneration(config)
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name)
 
+    # 3. Shard the Model using Tensor Parallelism
+    # `parallelize_module` will now correctly split the layers across the mesh.
     if xm.is_master_ordinal():
-        xm.rendezvous('download_done')
-        
-    if xm.is_master_ordinal():
-        print("Applying FSDP and sharding the model across all TPU cores...")
-    
-    model = XlaFullyShardedDataParallel(
-        model, 
-        auto_wrap_policy=qwen_fsdp_policy
-    )
-    
-    model.to(device)
-    model.eval()
+        print("Applying modern Tensor Parallelism and sharding the model...")
 
+    model = parallelize_module(model, device_mesh)
+    model.to(device) # Move the sharded model to the TPU
+
+    # Wait for all processes to finish setup
     xm.rendezvous('model_ready')
     if xm.is_master_ordinal():
-        print("Model sharded and ready on all cores.")
+        print("Model sharded with Tensor Parallelism and ready on all cores.")
 
     # --- MAIN AGENT LOOP ---
     max_steps = 20
     for step in range(max_steps):
-        tensors_to_broadcast = []
-        screenshot_size = (0, 0)
-        
+        screenshot = None
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
-            screenshot_size = screenshot.size
-            
-            user_instruction = "Find a folder called ui-tars"
-            formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
-            full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
-            
-            inputs = processor.apply_chat_template(
-                full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
-                padding=True, return_attention_mask=True
-            )
-            # --- THIS IS THE FINAL FIX ---
-            # Master process moves ITS tensors to the TPU before broadcasting.
-            tensors_to_broadcast = [
-                inputs['input_ids'].to(device), 
-                inputs['pixel_values'].to(device), 
-                inputs['attention_mask'].to(device)
-            ]
-        else:
-            # Other processes create empty placeholders DIRECTLY ON THE TPU DEVICE.
-            tensors_to_broadcast = [
-                torch.empty((1, 2048), dtype=torch.long, device=device), 
-                torch.empty((1, 3, 336, 336), dtype=torch.float32, device=device),
-                torch.empty((1, 2048), dtype=torch.long, device=device)
-            ]
-            # --- END FIX ---
 
-        # The broadcast will now succeed because all tensors on all processes are on an XLA device.
-        xm.collective_broadcast(tensors_to_broadcast)
+        # The master process sends the screenshot to all other processes
+        screenshot_list = [screenshot]
+        xm.collective_broadcast(screenshot_list)
+        screenshot = screenshot_list[0]
         
-        # All processes now have the same tensors on their TPU core.
-        # We just reassemble the dictionary.
-        inputs = {
-            'input_ids': tensors_to_broadcast[0], 
-            'pixel_values': tensors_to_broadcast[1].to(torch.bfloat16),
-            'attention_mask': tensors_to_broadcast[2]
-        }
+        # All processes now have the same screenshot and prepare the inputs
+        user_instruction = "Find a folder called ui-tars"
+        formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
+        full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
+        inputs = processor.apply_chat_template(full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        if 'pixel_values' in inputs:
+            inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
-        # --- GENERATION (All Processes Participate) ---
+        # --- GENERATION WITH TENSOR PARALLELISM ---
         if xm.is_master_ordinal():
             print("Generating response on all cores... (This may take several minutes on the first run)")
         
         with torch.no_grad():
-            output_ids = model.generate(
-                **inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id
-            )
+            output_ids = model.generate(**inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
 
         # --- EXECUTION (Main Process Only) ---
         if xm.is_master_ordinal():
-            original_width, original_height = screenshot_size
+            original_width, original_height = screenshot.size
             model_input_height, model_input_width = smart_resize(original_height, original_width)
             
-            raw_model_output_text = processor.batch_decode(output_ids, skip_special_tokens=True)[0]
+            input_length = inputs['input_ids'].shape[1]
+            generated_ids = output_ids[:, input_length:]
+            raw_model_output_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
             print("\n--- Raw Model Output ---")
             print(raw_model_output_text)
 
@@ -136,7 +106,6 @@ def _mp_fn(index):
             if not parsed_actions:
                 print("No valid action parsed. Stopping.")
                 break
-
             pyautogui_code = parsing_response_to_pyautogui_code(parsed_actions, original_height, original_width)
             print("\n--- Generated PyAutoGUI Code ---")
             print(pyautogui_code)
