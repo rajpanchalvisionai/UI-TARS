@@ -30,15 +30,13 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # --- THE REAL "MAGIC HANDSHAKE" ---
-    # Every process must initialize its TPU device early and independently
-    # to prevent a race condition. Creating a tiny tensor is the cleanest way.
+    # --- The "Magic Handshake" ---
     device = xm.xla_device()
     torch.randn(1, device=device)
-    xm.mark_step() # Ensure the operation completes.
+    xm.mark_step()
     if xm.is_master_ordinal():
         print("All processes have successfully initialized their TPU cores.")
-    # --- END MAGIC HANDSHAKE ---
+    # --- End Magic Handshake ---
 
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -93,12 +91,14 @@ def _mp_fn(index):
             )
             tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values'], inputs['attention_mask']]
         else:
-            # Other processes create empty placeholders.
+            # --- THIS IS THE FINAL FIX ---
+            # Create the placeholder tensors on the CPU to match the master process.
             tensors_to_broadcast = [
                 torch.empty((1, 2048), dtype=torch.long), 
                 torch.empty((1, 3, 336, 336), dtype=torch.float32),
                 torch.empty((1, 2048), dtype=torch.long)
             ]
+            # --- END FIX ---
 
         # The master sends its CPU tensors, and the other processes receive them on their CPU.
         xm.collective_broadcast(tensors_to_broadcast)
