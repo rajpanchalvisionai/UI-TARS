@@ -30,13 +30,12 @@ def qwen_fsdp_policy(module, recurse, unwrapped_params):
 
 # --- FSDP PARALLELISM SETUP ---
 def _mp_fn(index):
-    # --- The "Magic Handshake" ---
+    # The "Magic Handshake" to prevent permission errors.
     device = xm.xla_device()
     torch.randn(1, device=device)
     xm.mark_step()
     if xm.is_master_ordinal():
         print("All processes have successfully initialized their TPU cores.")
-    # --- End Magic Handshake ---
 
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
@@ -74,7 +73,6 @@ def _mp_fn(index):
         tensors_to_broadcast = []
         screenshot_size = (0, 0)
         
-        # Master process handles GUI and preprocessing.
         if xm.is_master_ordinal():
             print(f"\n--- Step {step + 1}/{max_steps} ---")
             print("Taking screenshot...")
@@ -89,25 +87,31 @@ def _mp_fn(index):
                 full_conversation, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
                 padding=True, return_attention_mask=True
             )
-            tensors_to_broadcast = [inputs['input_ids'], inputs['pixel_values'], inputs['attention_mask']]
-        else:
             # --- THIS IS THE FINAL FIX ---
-            # Create the placeholder tensors on the CPU to match the master process.
+            # Master process moves ITS tensors to the TPU before broadcasting.
             tensors_to_broadcast = [
-                torch.empty((1, 2048), dtype=torch.long), 
-                torch.empty((1, 3, 336, 336), dtype=torch.float32),
-                torch.empty((1, 2048), dtype=torch.long)
+                inputs['input_ids'].to(device), 
+                inputs['pixel_values'].to(device), 
+                inputs['attention_mask'].to(device)
+            ]
+        else:
+            # Other processes create empty placeholders DIRECTLY ON THE TPU DEVICE.
+            tensors_to_broadcast = [
+                torch.empty((1, 2048), dtype=torch.long, device=device), 
+                torch.empty((1, 3, 336, 336), dtype=torch.float32, device=device),
+                torch.empty((1, 2048), dtype=torch.long, device=device)
             ]
             # --- END FIX ---
 
-        # The master sends its CPU tensors, and the other processes receive them on their CPU.
+        # The broadcast will now succeed because all tensors on all processes are on an XLA device.
         xm.collective_broadcast(tensors_to_broadcast)
         
-        # All processes now have the same tensors and move them to their own TPU core.
+        # All processes now have the same tensors on their TPU core.
+        # We just reassemble the dictionary.
         inputs = {
-            'input_ids': tensors_to_broadcast[0].to(device), 
-            'pixel_values': tensors_to_broadcast[1].to(device).to(torch.bfloat16),
-            'attention_mask': tensors_to_broadcast[2].to(device)
+            'input_ids': tensors_to_broadcast[0], 
+            'pixel_values': tensors_to_broadcast[1].to(torch.bfloat16),
+            'attention_mask': tensors_to_broadcast[2]
         }
 
         # --- GENERATION (All Processes Participate) ---
