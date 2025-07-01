@@ -1,9 +1,8 @@
-# --- FINAL MODERN IMPORTS FOR TENSOR PARALLELISM ---
+# --- FINAL WORKING IMPORTS FOR MANUAL TENSOR PARALLELISM ---
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor.parallel import parallelize_module
+from torch_xla.experimental import spmd
 import torch_xla.runtime as runtime
 # --- END IMPORTS ---
 
@@ -26,40 +25,44 @@ def _mp_fn(index):
     device = xm.xla_device()
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # --- THIS IS THE MODERN API FOR TENSOR PARALLELISM ---
-    # 1. Create a Device Mesh
-    # This describes our 8 TPU cores as a single parallel group.
+    # --- Create a Device Mesh ---
     world_size = runtime.world_size()
-    device_mesh = init_device_mesh("xla", (world_size,))
+    device_mesh = spmd.Mesh(torch.arange(world_size), (world_size,), mesh_names=('model',))
 
-    # 2. Load Model on CPU
+    # --- Load Model on CPU ---
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-        # Load in bfloat16 to save CPU memory before sharding.
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-        model.eval()
     else:
-        # Other processes create a "meta" model (no memory used)
-        # and will receive the real weights during sharding.
-        from transformers import AutoConfig
-        config = AutoConfig.from_pretrained(model_name)
-        with torch.device('meta'):
-            model = Qwen2_5_VLForConditionalGeneration(config)
+        xm.rendezvous('download_done')
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.bfloat16)
 
-    # 3. Shard the Model using Tensor Parallelism
-    # `parallelize_module` will now correctly split the layers across the mesh.
     if xm.is_master_ordinal():
-        print("Applying modern Tensor Parallelism and sharding the model...")
+        xm.rendezvous('download_done')
 
-    model = parallelize_module(model, device_mesh)
-    model.to(device) # Move the sharded model to the TPU
+    # --- THIS IS THE KEY: MANUAL, EXPLICIT SHARDING ---
+    if xm.is_master_ordinal():
+        print("Applying MANUAL Tensor Parallelism and sharding the model...")
+    
+    # We manually shard the weights of the Linear layers across the 'model' axis of our mesh.
+    # This physically splits the computation, solving the vmem issue.
+    for layer in model.model.layers:
+        spmd.shard_tensor(layer.self_attn.q_proj.weight, mesh, (0, 1))
+        spmd.shard_tensor(layer.self_attn.k_proj.weight, mesh, (0, 1))
+        spmd.shard_tensor(layer.self_attn.v_proj.weight, mesh, (0, 1))
+        spmd.shard_tensor(layer.self_attn.o_proj.weight, mesh, (1, 0))
+        spmd.shard_tensor(layer.mlp.gate_proj.weight, mesh, (0, 1))
+        spmd.shard_tensor(layer.mlp.up_proj.weight, mesh, (0, 1))
+        spmd.shard_tensor(layer.mlp.down_proj.weight, mesh, (1, 0))
 
-    # Wait for all processes to finish setup
+    model.to(device)
+    model.eval()
+
     xm.rendezvous('model_ready')
     if xm.is_master_ordinal():
-        print("Model sharded with Tensor Parallelism and ready on all cores.")
+        print("Model MANUALLY sharded and ready on all cores.")
 
     # --- MAIN AGENT LOOP ---
     max_steps = 20
@@ -70,12 +73,10 @@ def _mp_fn(index):
             print("Taking screenshot...")
             screenshot = pyautogui.screenshot()
 
-        # The master process sends the screenshot to all other processes
         screenshot_list = [screenshot]
         xm.collective_broadcast(screenshot_list)
         screenshot = screenshot_list[0]
         
-        # All processes now have the same screenshot and prepare the inputs
         user_instruction = "Find a folder called ui-tars"
         formatted_prompt_text = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language='English')
         full_conversation = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": formatted_prompt_text}]}]
