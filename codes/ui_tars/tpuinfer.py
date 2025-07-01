@@ -1,8 +1,9 @@
-# --- FINAL WORKING IMPORTS FOR MANUAL TENSOR PARALLELISM ---
+# --- FINAL MODERN IMPORTS FOR EXPLICIT TENSOR PARALLELISM ---
 import torch
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
-from torch_xla.experimental import spmd
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor.parallel import parallelize_module, ColwiseParallel, RowwiseParallel
 import torch_xla.runtime as runtime
 # --- END IMPORTS ---
 
@@ -21,48 +22,59 @@ from prompt import COMPUTER_USE_DOUBAO
 
 # --- TENSOR PARALLELISM SETUP ---
 def _mp_fn(index):
-    # This launcher function is run on each of the 8 TPU cores.
+    # The "Magic Handshake" to prevent permission errors.
     device = xm.xla_device()
+    torch.randn(1, device=device)
+    xm.mark_step()
+    if xm.is_master_ordinal():
+        print("All processes have successfully initialized their TPU cores.")
+
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
     # --- Create a Device Mesh ---
     world_size = runtime.world_size()
-    device_mesh = spmd.Mesh(torch.arange(world_size), (world_size,), mesh_names=('model',))
+    device_mesh = init_device_mesh("xla", (world_size,))
 
     # --- Load Model on CPU ---
     if xm.is_master_ordinal():
         print("Master process loading model and processor...")
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+        # Load in bfloat16 to save CPU memory before sharding.
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+        model.eval()
     else:
-        xm.rendezvous('download_done')
+        # Other processes create a "meta" model (no memory used)
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name)
+        with torch.device('meta'):
+            model = Qwen2_5_VLForConditionalGeneration(config)
         processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.bfloat16)
 
+    # --- THIS IS THE KEY: EXPLICIT PARALLELISM PLAN ---
     if xm.is_master_ordinal():
-        xm.rendezvous('download_done')
+        print("Applying EXPLICIT Tensor Parallelism and sharding the model...")
 
-    # --- THIS IS THE KEY: MANUAL, EXPLICIT SHARDING ---
-    if xm.is_master_ordinal():
-        print("Applying MANUAL Tensor Parallelism and sharding the model...")
-    
-    # We manually shard the weights of the Linear layers across the 'model' axis of our mesh.
-    # This physically splits the computation, solving the vmem issue.
-    for layer in model.model.layers:
-        spmd.shard_tensor(layer.self_attn.q_proj.weight, mesh, (0, 1))
-        spmd.shard_tensor(layer.self_attn.k_proj.weight, mesh, (0, 1))
-        spmd.shard_tensor(layer.self_attn.v_proj.weight, mesh, (0, 1))
-        spmd.shard_tensor(layer.self_attn.o_proj.weight, mesh, (1, 0))
-        spmd.shard_tensor(layer.mlp.gate_proj.weight, mesh, (0, 1))
-        spmd.shard_tensor(layer.mlp.up_proj.weight, mesh, (0, 1))
-        spmd.shard_tensor(layer.mlp.down_proj.weight, mesh, (1, 0))
-
+    # `parallelize_module` is the modern PyTorch function. We now give it an
+    # explicit plan for how to shard the important layers.
+    model = parallelize_module(
+        model,
+        device_mesh,
+        {
+            "self_attn.q_proj": ColwiseParallel(),
+            "self_attn.k_proj": ColwiseParallel(),
+            "self_attn.v_proj": ColwiseParallel(),
+            "self_attn.o_proj": RowwiseParallel(),
+            "mlp.gate_proj": ColwiseParallel(),
+            "mlp.up_proj": ColwiseParallel(),
+            "mlp.down_proj": RowwiseParallel(),
+        },
+    )
     model.to(device)
-    model.eval()
 
+    # Wait for all processes to finish setup
     xm.rendezvous('model_ready')
     if xm.is_master_ordinal():
-        print("Model MANUALLY sharded and ready on all cores.")
+        print("Model sharded with explicit plan and ready on all cores.")
 
     # --- MAIN AGENT LOOP ---
     max_steps = 20
@@ -85,14 +97,12 @@ def _mp_fn(index):
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
-        # --- GENERATION WITH TENSOR PARALLELISM ---
         if xm.is_master_ordinal():
             print("Generating response on all cores... (This may take several minutes on the first run)")
         
         with torch.no_grad():
             output_ids = model.generate(**inputs, max_new_tokens=500, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
 
-        # --- EXECUTION (Main Process Only) ---
         if xm.is_master_ordinal():
             original_width, original_height = screenshot.size
             model_input_height, model_input_width = smart_resize(original_height, original_width)
@@ -124,7 +134,6 @@ def _mp_fn(index):
                 print(f"Error executing PyAutoGUI code: {e}")
                 break
 
-        # All processes wait here to stay in sync
         xm.rendezvous('step_complete')
 
     if xm.is_master_ordinal():
