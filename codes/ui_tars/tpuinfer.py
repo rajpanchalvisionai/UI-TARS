@@ -1,105 +1,130 @@
-#!/usr/bin/env python3
-# tpu_spmd_infer.py
-
+# -*- coding: utf-8 -*-
 import os
-# === Set before importing torch_xla ===
-os.environ.setdefault("PJRT_DEVICE", "TPU")
-os.environ.setdefault("XLA_DEBUG", "1")
-os.environ.setdefault("XLA_USE_SPMD", "1")
-os.environ.setdefault("XLA_AUTO_SPMD", "1")
-
+import sys
+import time
 import torch
 import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.runtime as xr
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
-import pyautogui, sys, time, os
-from PIL import Image
+import torch_xla.distributed.xla_multiprocessing as xmp
 
+# Enable SPMD auto-sharding
+xr.use_spmd(auto=True)
+assert xr.is_spmd(), "SPMD mode not enabled!"
+
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from PIL import Image
+import pyautogui
+
+# For custom parsing / prompts
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from action_parser import parse_action_to_structure_output, parsing_response_to_pyautogui_code, smart_resize
 from prompt import COMPUTER_USE_DOUBAO
 
 def _mp_fn(index):
-    # === Enable SPMD auto-sharding ===
-    xr.use_spmd(auto=True)
-    assert xr.is_spmd(), "SPMD not enabled"
-
     device = xm.xla_device()
-    torch.randn(1, device=device); xm.mark_step()
+    torch.randn(1, device=device)  # warm-up
+    xm.mark_step()
 
     if xm.is_master_ordinal():
-        print("All TPU processes ready, SPMD mode ON")
+        print(f"[SPMD] Running with {xr.global_runtime_device_count()} TPU cores")
 
     model_name = "ByteDance-Seed/UI-TARS-1.5-7B"
 
-    # Load model and processor (bf16)
+    # Load weights once (duplicate due to SPMD logical device)
     if xm.is_master_ordinal():
-        print("Master loading model")
+        print("Loading model and processor...")
     processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=torch.bfloat16
+    ).to(device)
     model.eval()
-    model.to(device)
-
     xm.mark_step()
-    xm.rendezvous("model_ready")
-    if xm.is_master_ordinal():
-        print("Model ready across TPU cores with SPMD")
 
-    # Main loop
+    if xm.is_master_ordinal():
+        print("[SPMD] Model loaded and replicated across shards.")
+
+    # Main inference loop
     for step in range(20):
         if xm.is_master_ordinal():
-            print(f"\n--- STEP {step+1}/20 ---")
+            print(f"\n--- Step {step + 1}/20 ---")
             screenshot = pyautogui.screenshot()
         else:
             screenshot = None
 
-        buffer = [screenshot]; xm.collective_broadcast(buffer)
-        screenshot = buffer[0]
+        lst = [screenshot]
+        xm.collective_broadcast(lst)
+        screenshot = lst[0]
 
-        user_instruction = "Find a folder called ui-tars"
-        prompt = COMPUTER_USE_DOUBAO.format(instruction=user_instruction, language="English")
-        conv = [{"role": "user", "content": [{"type": "image", "image": screenshot}, {"type": "text", "text": prompt}]}]
+        formatted_prompt = COMPUTER_USE_DOUBAO.format(
+            instruction="Find a folder called ui-tars", language="English"
+        )
+        full_conversation = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": screenshot},
+                {"type": "text", "text": formatted_prompt}
+            ]
+        }]
 
-        inputs = processor.apply_chat_template(conv, add_generation_prompt=True, tokenize=True,
-                                               return_dict=True, return_tensors="pt")
-        inputs = {k: v.to(device) for k,v in inputs.items()}
+        inputs = processor.apply_chat_template(
+            full_conversation,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         if 'pixel_values' in inputs:
             inputs['pixel_values'] = inputs['pixel_values'].to(torch.bfloat16)
 
         if xm.is_master_ordinal():
             print("Generating response...")
+
         with torch.no_grad():
-            output_ids = model.generate(**inputs, max_new_tokens=500, pad_token_id=processor.tokenizer.eos_token_id)
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=500,
+                do_sample=False,
+                pad_token_id=processor.tokenizer.eos_token_id
+            )
+
         xm.mark_step()
 
         if xm.is_master_ordinal():
-            orig_w, orig_h = screenshot.size
-            ih, iw = smart_resize(orig_h, orig_w)
-            in_len = inputs['input_ids'].shape[1]
-            generated = output_ids[:, in_len:]
-            out_text = processor.batch_decode(generated, skip_special_tokens=True)[0]
-            print("\nRAW OUTPUT:", out_text)
+            original_w, original_h = screenshot.size
+            mh, mw = smart_resize(original_h, original_w)
+            input_len = inputs['input_ids'].shape[1]
+            gen_ids = output_ids[:, input_len:]
+            raw_text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
+            print("\n--- Raw Model Output ---")
+            print(raw_text)
 
-            parsed = parse_action_to_structure_output(out_text, 1000, ih, iw, "qwen25vl")
-            if not parsed:
-                print("No actions → stopping."); break
+            actions = parse_action_to_structure_output(raw_text, 1000, mh, mw, "qwen25vl")
+            if not actions:
+                print("No valid actions parsed — exiting.")
+                break
 
-            code = parsing_response_to_pyautogui_code(parsed, orig_h, orig_w)
-            print("Generated PyAutoGUI Code:\n", code)
-            if code.strip() == "DONE":
-                print("Task completed."); break
+            py_code = parsing_response_to_pyautogui_code(actions, original_h, original_w)
+            print("\n--- PyAutoGUI Code ---")
+            print(py_code)
 
+            if py_code.strip() == "DONE":
+                print("Task complete!")
+                break
+
+            print("Executing actions...")
             try:
-                exec(code)
+                exec(py_code)
                 time.sleep(2)
             except Exception as e:
-                print("Exec error:", e); break
+                print(f"Error executing actions: {e}")
+                break
 
-        xm.rendezvous("step_complete")
+        xm.rendezvous(f"step_complete_{step}")
 
     if xm.is_master_ordinal():
-        print("=== SPMD TPU Agent Finished ===")
+        print("\n--- UI Agent Completed ---")
 
 if __name__ == "__main__":
-    xmp.spawn(_mp_fn)
+    xmp.spawn(_mp_fn, args=(), nprocs=None)
